@@ -1,0 +1,748 @@
+---
+title: "R Notebook"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r}
+library(ggplot2); library(MASS); library(splines); library(rstan)
+options(mc.cores = parallel::detectCores())
+rstan_options(auto_write = TRUE)
+```
+
+Load virus data
+```{r}
+covid <- read.csv("/Users/tschappe/Documents/NC\ State\ Classes/ST540/Final\ Project/04-20-2020.csv")
+# covid <- read.csv("/Volumes/tschappe/Documents/NC\ State\ Classes/ST540/Final\ Project/04-20-2020.csv")
+#Subset to get only US
+covid <- covid[covid$Country_Region == "US" ,]
+#Remove non-state entries
+covid <- covid[nchar(as.character(covid$Admin2)) > 0, ]
+#Get state abbreviations in from a key file
+state.abb <- read.csv("/Users/tschappe/Documents/NC\ State\ Classes/ST540/Final\ Project/state_abb_key.csv")
+# state.abb <- read.csv("/Volumes/tschappe/Documents/NC\ State\ Classes/ST540/Final\ Project/state_abb_key.csv")
+#Make a new column with state abbreviations
+state.abb$State <- as.character(state.abb$State)
+state.abb$State <- gsub('^\\s', '', state.abb$State)
+state.abb$Abb <- as.character(state.abb$Abb)
+covid$Province_State <- as.character(covid$Province_State)
+#Loop through and grab the abbreviation for each state
+covid$state_abb <- 1:nrow(covid)
+for (i in 1:nrow(covid)) {
+  covid$state_abb[i] <- (state.abb$Abb[state.abb$State == covid$Province_State[i]])
+}
+#Paste with county to make state_county column
+covid$state_county <- paste(covid$state_abb, covid$Admin2, sep = "_")
+```
+
+Load population data by county
+```{r}
+pop <- read.csv("/Users/tschappe/Documents/NC\ State\ Classes/ST540/Final\ Project/co-est2019-alldata.csv")
+# pop <- read.csv("/Volumes/tschappe/Documents/NC\ State\ Classes/ST540/Final\ Project/co-est2019-alldata.csv")
+#Turn 'Doña Ana County' in NM to 'Dona Ana'
+pop$CTYNAME <- as.character(pop$CTYNAME)
+pop$CTYNAME[1835] <- "Dona Ana County"
+#Subset to get rid of any row without a comma (full states)
+pop <- pop[!(pop$CTYNAME %in% grep(' [CountyParish]', as.character(pop$CTYNAME), invert=T, value=T)), ]
+# pop$CTYNAME <- as.factor(pop$CTYNAME)
+#Strip "County" from the countyname and make a State_County column in the population dataset
+# pop$county <- gsub(" County", "", pop$CTYNAME)
+#Make county column
+pop$county <- gsub('\\sParish', '', gsub('\\sCounty', '', pop$CTYNAME))
+#Get state abbreviations in from a key file
+state.abb <- read.csv("/Users/tschappe/Documents/NC\ State\ Classes/ST540/Final\ Project/state_abb_key.csv")
+# state.abb <- read.csv("/Volumes/tschappe/Documents/NC\ State\ Classes/ST540/Final\ Project/state_abb_key.csv")
+#Make a new column with state abbreviations
+state.abb$State <- as.character(state.abb$State)
+state.abb$State <- gsub('^\\s', '', state.abb$State)
+state.abb$Abb <- as.character(state.abb$Abb)
+pop$STNAME <- as.character(pop$STNAME)
+#Loop through and grab the abbreviation for each state
+pop$state_abb <- 1:nrow(pop)
+for (i in 1:nrow(pop)) {
+  pop$state_abb[i] <- (state.abb$Abb[state.abb$State == pop$STNAME[i]])
+}
+#Paste with county to make state_county column
+pop$state_county <- paste(pop$state_abb, pop$county, sep = "_")
+```
+
+Load land area data by county
+```{r}
+area <- read.csv("/Users/tschappe/Documents/NC\ State\ Classes/ST540/Final\ Project/LND01.csv")
+# area <- read.csv("/Volumes/tschappe/Documents/NC\ State\ Classes/ST540/Final\ Project/LND01.csv")
+#Subset to get rid of any row without a comman (full states and the US)
+area <- area[!(area$Areaname %in% grep('\\,', area$Areaname, invert = T, value = T)), ]
+#Strip away county info to get just state
+area$state <- gsub("[A-Za-z \\t\\'\\.\\-]+\\,\\s", "", area$Areaname)
+#Strip away state info to get county
+area$county <- gsub("\\, [A-Z]+", "", area$Areaname)
+#Combine them to get State_County that matches the pop dataframe
+area$state_county <- paste(area$state, area$county, sep="_")
+```
+
+Healthcare coverage
+```{r}
+coverage <- read.csv("/Users/tschappe/Documents/NC\ State\ Classes/ST540/Final\ Project/SAHIE_21APR20_11_22_31_15.csv")
+# coverage <- read.csv("/Volumes/tschappe/Documents/NC\ State\ Classes/ST540/Final\ Project/SAHIE_21APR20_11_22_31_15.csv")
+#Remove whole-state entries
+coverage <- coverage[coverage$Name %in% grep('\\,', coverage$Name, invert = F, value = T), ]
+#Make county column
+coverage$county <- gsub('\\sParish\\,\\s[A-Za-z\\s \\.]+', '', gsub('\\sCounty\\,\\s[A-Za-z\\s \\.]+', '', coverage$Name))
+#For 'counties' that have something like city in them instead of "County"
+# coverage$county <- gsub('\\,\\s[A-Z]+', '', coverage$county)
+#Make state abb column
+coverage$state <- gsub("[A-Za-z \\,\\.\\s\\-\\'\\-]+\\s[PCc][a-z]+\\,\\s", "", coverage$Name)
+# coverage$state <- gsub("[A-Za-z \\,\\.\\s\\-\\']+\\sParish\\,\\s", "", coverage$state)
+#Remove Alaska, Virginia b/c weird
+coverage <- coverage[coverage$Name %in% grep('\\, AK', coverage$Name, invert = T, value = T), ]
+# coverage <- coverage[coverage$Name %in% grep('\\, VA', coverage$Name, invert = T, value = T), ]
+#Change specific ones to be consistent
+coverage$county[coverage$county == "Baltimore city"] <- "Baltimore City"
+coverage$county[coverage$county == "St. Louis city"] <- "St. Louis City"
+#Make state_county column
+coverage$state_county <- paste(coverage$state, coverage$county, sep="_")
+```
+
+Hospitals
+```{r}
+hosp <- read.csv("/Users/tschappe/Documents/NC\ State\ Classes/ST540/Final\ Project/Hospitals.csv")
+# hosp <- read.csv("/Volumes/tschappe/Documents/NC\ State\ Classes/ST540/Final\ Project/Hospitals.csv")
+#Subset only 'General medical and surgical' hospitals
+hosp <- hosp[hosp$NAICS_DESC %in% c("CHILDREN'S HOSPITALS, GENERAL", "GENERAL MEDICAL AND SURGICAL HOSPITALS"), ]
+#Get rid of AK and VA
+hosp <- hosp[!(as.character(hosp$STATE) %in% c("AK")), ]
+#Make a lowercase county column
+hosp$county <- tolower(hosp$COUNTY)
+#Turn any letter at the start of the line or after a space into uppercase
+hosp$county <- gsub('^([a-z])', '\\U\\1', gsub('\\s([a-z])', ' \\U\\1', hosp$county, perl=T), perl = T)
+#Make a state_county
+hosp$state_county <- paste(hosp$STATE, hosp$county, sep="_")
+#Loop over unique state_county values and count the number of rows (hospitals)
+hosp.count <- 1:length(unique(hosp$state_county))
+for (i in 1:length(unique(hosp$state_county))) {
+  hosp.count[i] <- nrow(hosp[hosp$state_county == unique(hosp$state_county)[i], ])
+}
+#Put the hospital counts and state_county columns together
+hosp.count.df <- data.frame(hosp=hosp.count, state_county=unique(hosp$state_county))
+#Only counties with hopitals are listed here (because obviously a hospital that doesn't exist wouldn't be listed), so let's grab the names of the counties that aren't here and make them have 0 hospitals
+no.hosp <- data.frame(hosp=rep(0, length(pop$state_county[!(pop$state_county %in% hosp.count.df$state_county)])), state_county=pop$state_county[!(pop$state_county %in% hosp.count.df$state_county)])
+hosp.count.df <- rbind(hosp.count.df, no.hosp)
+#Order the dataframe
+hosp.count.df <- hosp.count.df[order(as.character(hosp.count.df$state_county)), ]
+```
+
+Average weekly salary
+```{r}
+salary <- read.csv("/Users/tschappe/Documents/NC\ State\ Classes/ST540/Final\ Project/prior_yr_county_high_level/allhlcn18.csv")
+# salary <- read.csv("/Volumes/tschappe/Documents/NC\ State\ Classes/ST540/Final\ Project/prior_yr_county_high_level/allhlcn18.csv")
+#Remove non-counties
+salary <- salary[nchar(as.character(salary$St.Name)) > 0 ,]
+#Remove state-wide characteristics where Cnty = 0
+salary <- salary[salary$Cnty > 0, ]
+#Grab only the 'total employees' row for each county
+salary <- salary[salary$Ownership == "Total Covered", ]
+
+#Make county column
+salary$county <- gsub('\\sCity\\,\\s[A-Za-z\\s \\.]+', '', gsub('\\sParish\\,\\s[A-Za-z\\s \\.]+', '', gsub('\\sCounty\\,\\s[A-Za-z\\s \\.]+', '', salary$Area)))
+#For 'counties' that have something like city in them instead of "County"
+salary$county <- gsub('\\,\\s[A-Z]+', '', salary$county)
+#Remove unknown counties
+salary <- salary[salary$county %in% grep('Unknown', salary$county, invert = T, value = T), ]
+#Remove Alaska b/c weird
+salary <- salary[salary$St.Name != "Alaska", ]
+#Get state abbreviations in from a key file
+state.abb <- read.csv("/Users/tschappe/Documents/NC\ State\ Classes/ST540/Final\ Project/state_abb_key.csv")
+# state.abb <- read.csv("/Volumes/tschappe/Documents/NC\ State\ Classes/ST540/Final\ Project/state_abb_key.csv")
+#Make a new column with state abbreviations
+state.abb$State <- as.character(state.abb$State)
+state.abb$State <- gsub('^\\s', '', state.abb$State)
+state.abb$Abb <- as.character(state.abb$Abb)
+#Loop through and grab the abbreviation for each state
+salary$state_abb <- 1:nrow(salary)
+for (i in 1:nrow(salary)) {
+  salary$state_abb[i] <- (state.abb$Abb[state.abb$State == salary$St.Name[i]])
+}
+#Make state_county column
+salary$state_county <- paste(salary$state_abb, salary$county, sep="_")
+```
+
+2016 presidential election votes
+```{r}
+pres <- read.csv("/Users/tschappe/Documents/NC\ State\ Classes/ST540/Final\ Project/election-context-2018.csv")
+# pres <- read.csv("/Volumes/tschappe/Documents/NC\ State\ Classes/ST540/Final\ Project/election-context-2018.csv")
+#Calculate total votes for 2016 presidential election
+pres$votes <- pres$trump16 + pres$clinton16 + pres$otherpres16
+#Calculate percentage votes for Trump
+pres$trump.per <- pres$trump16/pres$votes
+#Get state abbreviations in from a key file
+state.abb <- read.csv("/Users/tschappe/Documents/NC\ State\ Classes/ST540/Final\ Project/state_abb_key.csv")
+# state.abb <- read.csv("/Volumes/tschappe/Documents/NC\ State\ Classes/ST540/Final\ Project/state_abb_key.csv")
+#Make a new column with state abbreviations
+state.abb$State <- as.character(state.abb$State)
+state.abb$State <- gsub('^\\s', '', state.abb$State)
+state.abb$Abb <- as.character(state.abb$Abb)
+#Loop through and grab the abbreviation for each state
+pres$state_abb <- 1:nrow(pres)
+for (i in 1:nrow(pres)) {
+  pres$state_abb[i] <- (state.abb$Abb[state.abb$State == pres$state[i]])
+}
+#Make state_county column
+pres$state_county <- paste(pres$state_abb, pres$county, sep="_")
+```
+
+Previous 2 days of cases
+```{r}
+#Previous day
+prev.day <- read.csv("/Users/tschappe/Documents/NC\ State\ Classes/ST540/Final\ Project/04-19-2020.csv")
+# prev.day <- read.csv("/Users/tschappe/Documents/NCState/Classes/ST540/Final\ Project/04-19-2020.csv")
+#Subset to get only US
+prev.day <- prev.day[prev.day$Country_Region == "US" ,]
+#Remove non-state entries
+prev.day <- prev.day[nchar(as.character(prev.day$Admin2)) > 0, ]
+#Get state abbreviations in from a key file
+state.abb <- read.csv("/Users/tschappe/Documents/NC\ State\ Classes/ST540/Final\ Project/state_abb_key.csv")
+# state.abb <- read.csv("/Volumes/tschappe/Documents/NC\ State\ Classes/ST540/Final\ Project/state_abb_key.csv")
+#Make a new column with state abbreviations
+state.abb$State <- as.character(state.abb$State)
+state.abb$State <- gsub('^\\s', '', state.abb$State)
+state.abb$Abb <- as.character(state.abb$Abb)
+prev.day$Province_State <- as.character(prev.day$Province_State)
+#Loop through and grab the abbreviation for each state
+prev.day$state_abb <- 1:nrow(prev.day)
+for (i in 1:nrow(prev.day)) {
+  prev.day$state_abb[i] <- (state.abb$Abb[state.abb$State == prev.day$Province_State[i]])
+}
+#Paste with county to make state_county column
+prev.day$state_county <- paste(prev.day$state_abb, prev.day$Admin2, sep = "_")
+
+prev.2day <- read.csv("/Users/tschappe/Documents/NC\ State\ Classes/ST540/Final\ Project/04-18-2020.csv")
+# prev.2day <- read.csv("/Users/tschappe/Documents/NCState/Classes/ST540/Final\ Project/04-18-2020.csv")
+#Subset to get only US
+prev.2day <- prev.2day[prev.2day$Country_Region == "US" ,]
+#Remove non-state entries
+prev.2day <- prev.2day[nchar(as.character(prev.2day$Admin2)) > 0, ]
+#Get state abbreviations in from a key file
+state.abb <- read.csv("/Users/tschappe/Documents/NC\ State\ Classes/ST540/Final\ Project/state_abb_key.csv")
+# state.abb <- read.csv("/Volumes/tschappe/Documents/NC\ State\ Classes/ST540/Final\ Project/state_abb_key.csv")
+#Make a new column with state abbreviations
+state.abb$State <- as.character(state.abb$State)
+state.abb$State <- gsub('^\\s', '', state.abb$State)
+state.abb$Abb <- as.character(state.abb$Abb)
+prev.2day$Province_State <- as.character(prev.2day$Province_State)
+#Loop through and grab the abbreviation for each state
+prev.2day$state_abb <- 1:nrow(prev.2day)
+for (i in 1:nrow(prev.2day)) {
+  prev.2day$state_abb[i] <- (state.abb$Abb[state.abb$State == prev.2day$Province_State[i]])
+}
+#Paste with county to make state_county column
+prev.2day$state_county <- paste(prev.2day$state_abb, prev.2day$Admin2, sep = "_")
+
+#Combine them
+prev.day.out <- subset(prev.day, select=c("FIPS", "Confirmed", "Deaths", "state_county"))
+prev.2day.out <- subset(prev.2day, select=c("FIPS", "Confirmed", "Deaths", "state_county"))
+prev.day.merged <- merge(prev.day.out, prev.2day.out, by="FIPS")
+prev.day.merged$prev.ratio <- prev.day.merged$Confirmed.x/prev.day.merged$Confirmed.y
+prev.day.merged$prev.diff <- prev.day.merged$Confirmed.x - prev.day.merged$Confirmed.y
+prev.day.merged.out <- subset(prev.day.merged, select=c("prev.ratio", "prev.diff", "state_county.x"))
+colnames(prev.day.merged.out)[3] <- c("state_county")
+```
+
+Tests per person for each state
+```{r}
+#Load state population data
+state.pop <- read.csv("/Users/tschappe/Documents/NC\ State\ Classes/ST540/Final\ Project/SCPRC-EST2019-18+POP-RES.csv")
+state.pop <- state.pop[!(state.pop$NAME %in% c("United States", "Puerto Rico Commonwealth")), ]
+#Get state abbreviations in from a key file
+state.abb <- read.csv("/Users/tschappe/Documents/NC\ State\ Classes/ST540/Final\ Project/state_abb_key.csv")
+# state.abb <- read.csv("/Volumes/tschappe/Documents/NC\ State\ Classes/ST540/Final\ Project/state_abb_key.csv")
+#Make a new column with state abbreviations
+state.abb$State <- as.character(state.abb$State)
+state.abb$State <- gsub('^\\s', '', state.abb$State)
+state.abb$Abb <- as.character(state.abb$Abb)
+state.pop$NAME <- as.character(state.pop$NAME)
+#Loop through and grab the abbreviation for each state
+state.pop$state_abb <- 1:nrow(state.pop)
+for (i in 1:nrow(state.pop)) {
+  state.pop$state_abb[i] <- (state.abb$Abb[state.abb$State == state.pop$NAME[i]])
+}
+
+#Load COVID testing data
+covid.test <- read.csv("/Users/tschappe/Documents/NC\ State\ Classes/ST540/Final\ Project/covid_testing.csv")
+covid.test <- covid.test[covid.test$State %in% state.pop$state_abb, ]
+covid.test$tests <- as.integer(covid.test$tests)
+pop.temp <- NULL
+for (i in 1:nrow(covid.test)) {
+  pop.temp[i] <- state.pop$POPESTIMATE2019[as.character(state.pop$state_abb) == as.character(covid.test$State[i])]
+}
+covid.test$pop <- as.integer(pop.temp)
+#Calculate COVID tests per person
+covid.test$test.per.pop <- covid.test$tests/covid.test$pop
+```
+
+Socioeconomic vulnerability index
+```{r}
+svi <- read.csv("/Users/tschappe/Documents/NC\ State\ Classes/ST540/Final\ Project/SVI2018_US_COUNTY.csv")
+#Remove 'City' from county column
+svi$county <- gsub('\\sCity', '', svi$COUNTY)
+#Make state_county column
+svi$state_county <- paste(svi$ST_ABBR, svi$county, sep="_")
+```
+
+Long-term care facilities
+```{r}
+#Assume that if not listed, 0 retirement care available in county
+retire <- read.table("/Users/tschappe/Documents/NC\ State\ Classes/ST540/Final\ Project/combine17.txt", sep=",", header=T)
+#Subset only retire homes based on NAICS number
+retire <- retire[retire$NAICS %in% c('6233', '623311', '623311', '623312'),]
+#Get rid of the "state total" rows
+retire <- retire[!(retire$CTYDSCR %in% grep('Total', retire$CTYDSCR, value = T)), ]
+retire <- retire[retire$SDSCR != "United States",]
+#Remove "parish" and capitalize city
+retire$CTYDSCR <- gsub('\\sParish', '', retire$CTYDSCR)
+retire$CTYDSCR <- gsub('city', 'City', retire$CTYDSCR)
+#Remove city
+retire$CTYDSCR <- gsub(' City', '', retire$CTYDSCR)
+#Get state abbreviations in from a key file
+state.abb <- read.csv("/Users/tschappe/Documents/NC\ State\ Classes/ST540/Final\ Project/state_abb_key.csv")
+# state.abb <- read.csv("/Volumes/tschappe/Documents/NC\ State\ Classes/ST540/Final\ Project/state_abb_key.csv")
+#Make a new column with state abbreviations
+state.abb$State <- as.character(state.abb$State)
+state.abb$State <- gsub('^\\s', '', state.abb$State)
+state.abb$Abb <- as.character(state.abb$Abb)
+retire$SDSCR <- as.character(retire$SDSCR)
+#Loop through and grab the abbreviation for each state
+retire$state_abb <- 1:nrow(retire)
+for (i in 1:nrow(retire)) {
+  retire$state_abb[i] <- (state.abb$Abb[state.abb$State == retire$SDSCR[i]])
+}
+retire$state_county <- paste(retire$state_abb, retire$CTYDSCR, sep="_")
+#Grab the state_county values from svi df that are not in the retire df because those counties have 0 retirement communities, then bind them to the retire df
+retire.out <- rbind(subset(retire, select=c("state_county", "EST")), data.frame(state_county=svi$state_county[!(svi$state_county %in% retire$state_county)], EST=as.factor(rep(0, length(svi$state_county[!(svi$state_county %in% retire$state_county)])))))
+retire.out$EST <- as.integer(as.character(retire.out$EST))
+# nrow(retire.out[retire.out$EST > 0, ]) #Perfect
+#Give it a better name
+colnames(retire.out)[colnames(retire.out) == "EST"] <- "retire.comm"
+```
+
+
+Get data together
+It looks like the covid-19 dataframe has the least number of counties observed (it does have counties with 0, so it's not that the rest are 0), subset all other DFs to match
+Area, pop, coverage, hosp, salary, pres
+```{r}
+#First, subset only the columns that we want from each DF
+covid.out <- subset(covid, select = c("Confirmed", "Deaths", "state_county"))
+area.out <- subset(area, select = c("LND110210D", "state_county")); colnames(area.out) <- c("area", "state_county")
+# pop.out <- subset(pop, select = c("POPESTIMATE2019", "state_county")); colnames(pop.out) <- c("population", "state_county") #SVI contains more pop info
+coverage.out <- subset(coverage, select = c("Uninsured...", "state_county")); colnames(coverage.out) <- c("uninsured", "state_county")
+salary.out <- subset(salary, select = c("Annual.Average.Weekly.Wage", "state_county")); colnames(salary.out) <- c("weekly.wage", "state_county")
+pres.out <- subset(pres, select = c("trump.per", "age65andolder_pct", "rural_pct", "ruralurban_cc", "lesscollege_pct", "state_county")); pres.out$trump.per <- pres.out$trump.per * 100
+covid.test.out <- subset(covid.test, select=c("test.per.pop", "State"))
+svi.out <- subset(svi, select = c("E_TOTPOP", "SPL_THEME1", "MP_CROWD", "state_county"))
+colnames(svi.out) <- c("pop", "svi", "crowding", "state_county")
+
+# nrow(covid[covid$state_county %in% grep("LA", covid$state_county, value=T), ])
+# nrow(area[area$state_county %in% grep("LA", area$state_county, value=T), ])
+# nrow(pop[pop$state_county %in% grep("LA", pop$state_county, value=T), ]) #Problem
+# nrow(coverage[coverage$state_county %in% grep("LA", coverage$state_county, value=T), ])
+# nrow(salary[salary$state_county %in% grep("LA", salary$state_county, value=T), ])
+# nrow(pres[pres$state_county %in% grep("LA", pres$state_county, value=T), ])
+# nrow(prev.2day[prev.2day$state_county %in% grep("LA", prev.2day$state_county, value=T), ])
+# nrow(prev.day.merged.out[prev.day.merged.out$state_county %in% grep("LA", prev.day.merged.out$state_county, value=T), ])
+
+#Merge them all together with nested merge calls
+dat.final <- merge(
+  merge(
+    merge(
+      merge(
+        merge(
+          merge(
+            merge(
+              merge(
+                covid.out,
+                prev.day.merged.out, by = "state_county"),
+                area.out, by = "state_county"),
+                svi.out, by = "state_county"), #Replaces pop out b/c has better pop data
+                coverage.out, by="state_county"),
+                hosp.count.df, by="state_county"),
+                salary.out, by="state_county"),
+                pres.out, by="state_county"),
+                retire.out, by="state_county")
+dat.final$pop.dens <- dat.final$pop/dat.final$area
+#Repeat tests per pop for each state
+#Make a state column
+dat.final$state <- as.character(gsub("\\_[A-Za-z \\,\\.\\s\\-\\'\\-]+", "", dat.final$state_county))
+dat.final$tests.per.pop <- rep(1, nrow(dat.final))
+for (i in 1:nrow(dat.final)) {
+  dat.final$tests.per.pop[i] <- covid.test.out$test.per.pop[covid.test.out$State == dat.final$state[i]]
+}
+#Remove NAs
+dat.final <- dat.final[!(is.na(dat.final$prev.ratio)), ]
+#Make pop density into log pop density
+dat.final$log.pop.dens <- log(dat.final$pop.dens)
+dat.final$log.pop <- log(dat.final$pop)
+#Remove Bedford County, VA b/c two of them
+dat.final <- dat.final[dat.final$state_county != "VA_Bedford", ]
+#Verify format
+dat.final$uninsured <- as.numeric(as.character(dat.final$uninsured))
+dat.final$weekly.wage <- as.numeric(as.character(gsub(',', '', dat.final$weekly.wage)))
+dat.final$ruralurban_cc <- as.factor(dat.final$ruralurban_cc)
+# str(dat.final)
+```
+
+Center and scale data
+```{r}
+dat.final[,c(5:6,8:15,17:19,21:23)] <- scale(dat.final[,c(5:6,8:15,17:19,21:23)], center = TRUE, scale = T)
+# str(dat.final)
+```
+
+
+Use basis functions for predictors
+```{r}
+library(splines)
+#Make the basis functions with 10 df
+k <- 5
+b.log.pop.dens <- bs(dat.final$log.pop.dens, df=k, intercept=T)
+b.prev.diff <- bs(dat.final$prev.diff, df=k, intercept=T)
+b.trump.per <- bs(dat.final$trump.per, df=k, intercept=T)
+b.uninsured <- bs(dat.final$uninsured, df=k, intercept=T)
+b.hosp <- bs(dat.final$hosp, df=k, intercept=T)
+b.weekly.wage <- bs(dat.final$weekly.wage, df=k, intercept=T)
+b.age56andolder_pct <- bs(dat.final$age65andolder_pct, df=k, intercept=T)
+b.lesscollege_pct <- bs(dat.final$lesscollege_pct, df=k, intercept=T)
+b.rural_pct <- bs(dat.final$rural_pct, df=k, intercept=T)
+b.tests.per.pop <- bs(dat.final$tests.per.pop, df=k, intercept=T)
+b.svi <- bs(dat.final$svi, df=k, intercept=T)
+b.crowding <- bs(dat.final$crowding, df=k, intercept=T)
+b.retire.comm <- bs(dat.final$retire.comm, df=k, intercept=T)
+b.log.pop <- bs(dat.final$log.pop, df=k, intercept=T)
+
+#Create X matrix to model true infection rate
+#Create tensor product splines by pairwise multiplying the univariate splines
+X <- NULL
+for (i in 1:ncol(b.log.pop.dens)) {
+  for (j in 1:ncol(b.prev.diff)) {
+    # for (k in 1:ncol(b.rural_pct)) {
+      for (l in 1:ncol(b.svi)) {
+          # for (m in 1:ncol(b.crowding)) {
+            for (n in 1:ncol(b.retire.comm)) {
+              X <- cbind(X, b.log.pop.dens[,i]*b.prev.diff[,j]*b.svi[,l]*b.retire.comm[,n])
+            }
+          # }
+      }
+    # }
+  }
+}
+X    <- as.matrix(X[,apply(X,2,max)>0.1])  # Remove basis function that are near zero for all sites
+X    <- ifelse(X>0.001,X,0)
+X <- cbind(rep(1,nrow(X)), X)
+p <- ncol(X)
+
+#Create Z matrix to model "underestimation proportion"
+#Create tensor product splines by pairwise multiplying the univariate splines
+Z <- NULL
+# for (i in 1:ncol(b.trump.per)) {
+  for (j in 1:ncol(b.uninsured)) {
+    for (k in 1:ncol(b.hosp)) {
+      for (l in 1:ncol(b.tests.per.pop)) {
+          # for (m in 1:ncol(b.log.pop)) {
+    Z <- cbind(Z, b.uninsured[,j]*b.tests.per.pop[,l])
+          # }
+      }
+    }
+  }
+# }
+
+Z    <- Z[,apply(Z,2,max)>0.1]  # Remove basis function that are near zero for all sites
+Z    <- ifelse(Z>0.001,Z,0)
+#Add intercept
+Z <- cbind(rep(1,nrow(Z)), Z)
+pz <- ncol(Z)
+```
+
+## Model with theta predicted
+
+Calculations for informative prior for gamma[1] based on antibody testing:
+
+NY city pop: 8398748; antibody prop: 0.21; antibody est: 1763737; confirmed: 141235; underestimation prop: 0.0801
+Westchester county pop: 967506; antibody prop: 0.12; antibody est: 116101; confirmed: 24306; underestimation prop: 0.2093
+Rockland county pop: 325789; antibody prop: 0.12; antibody est: 39095; confirmed: 9457; underestimation prop: 0.2419
+
+LA county pop: 10039107; antibody prop: 0.05; antibody est: 501955; confirmed: 13823; underestimation prop: 0.0275
+
+Note how much lower (worse) the underestimation proportion is for LA county. But we've also heard it was biased towards testing people who were more likely to be infected than expected at random, so it would be biased towards having a higher antibody prop. Let's assume it was actually 0.03 instead.
+
+LA county pop: 10039107; antibody prop: 0.03; antibody est: 301173; confirmed: 13823; underestimation prop: 0.04589
+
+It's still really low. It might also be that NY has been able to do regular testing more?
+
+Based on all of this, let's set the prior to have 95% of its density on [0.03,0.25], which in logit scale is [-3.4761,-1.0986]. So the mean is the average of -2.287355 and the sd is 2.377487/2/1.96=0.6065018. Thus, we want a Normal(-2.287355,0.3678444).
+
+For the informative prior for beta[1], use similar logic to get 95% of density on [0.02,0.2], so we want mean -2.63906, var=0.3923538
+
+Need to transform the JAGS model into the Negative Binomial parameterization that STAN uses
+```{r}
+stan.nb4.stancode <- '
+data {
+  int<lower=1> N;                 //Number of observations
+  int<lower=1> K;                 //Number of predictors in X
+  int<lower=1> GK;                //Number of predictors in Z
+  int<lower=1> pop[N];              //Population value
+  matrix[N,K] X;                  //Fixed effects model matrix
+  matrix[N,GK] Z;                 //Fixed effects model matrix for theta
+  int y[N];                      //Response variable
+}
+
+//transformed data{
+//  real logpop[N];
+  
+//  logpop = log(pop);
+//}
+
+parameters {
+  real<lower=0,upper=100> r; //Size parameter for NB
+  vector<lower=0.001,upper=1>[N] theta; //Underestimation proportion parameter
+  vector<lower=0.001,upper=1>[N] lambda; //True infection rate
+  real<lower=0> rr; //Sample size parameter for beta regression of theta
+  real<lower=0> lr; //Sample size parameter for beta regression of lambda
+  //real mu_b; //Hypermean parameter for betas
+  real<lower=0> tau_b; //Hypervariance parameter for betas
+  real<lower=0> tau_g; //Hypervariance parameter for gammas
+  vector[K] beta_raw; //X regression params
+  vector[GK] gamma_raw; //Z regression params
+}
+
+transformed parameters {
+  real<lower=0.0001> m[N]; //Mean of NB
+  //vector<lower=0.0001>[N] lambda; //True infection rate
+  //vector<lower=0.0001>[N] theta; //Underestimation proportion
+  vector<lower=0,upper=1>[N] p; //Mean of beta distribution
+  vector<lower=0,upper=1>[N] q; //Mean of beta distribution
+  vector[K] beta;
+  vector[GK] gamma;
+
+  beta = beta_raw * tau_b;
+  gamma = gamma_raw * tau_g;
+  q = inv_logit(X*beta); //lambda is exp of X*B
+  p = inv_logit(Z*gamma); //p is inverse-logit of Z*G
+  for (i in 1:N) {
+    m[i] = pop[i]*theta[i]*lambda[i]; //Mean of NB is population x theta x true.rate (lambda)
+  }
+
+}
+
+model {
+  //mu_b ~ normal(0, 1);
+  tau_b ~ cauchy(0, 2.5);
+  tau_g ~ cauchy(0, 2.5);
+  //to_vector(lambda) ~ beta(1,1);
+  //target += lambda - 2 * log(1 + exp(lambda)); 
+  //theta ~ beta(31, 835); //Informative prior from LA data
+  r ~ cauchy(0, 2.5); //Prior on size parameter for NB
+  for (k in 2:K) {
+    beta_raw[k] ~ double_exponential(0, 1); //Normal shrinkage prior for betas with non-zero mean
+  }
+  beta_raw[1] ~ normal(-2.639057, 0.3923538);
+  gamma_raw[1] ~ normal(-2.287355,0.3678444); //Informative prior for intercept from NY antibody testing (see note above)
+  for (g in 2:GK) {
+    gamma_raw[g] ~ double_exponential(0, 1); //LASSO shrinkage prior for gammas
+  }
+  
+  //Likelihood
+  for (j in 1:N) {
+    lambda[j] ~ beta(lr*q[j], lr*(1-q[j]));
+    theta[j] ~ beta(rr*p[j],rr*(1-p[j]));
+    y[j] ~ neg_binomial(r, r/m[j]); //Stans beta is r/m
+  }
+}
+
+generated quantities {
+  int y_rep[N];                           //Vector for posterior predictive distribution
+  vector[N] log_lik;                            //Vector for log-likelihood values for WAIC calculation
+  vector[N] true_inf;
+  
+  //log_lik = neg_binomial_2_log_glm_lpmf(y | X, alpha, beta, phi);
+  //y_rep = neg_binomial(r, r/m);
+  
+  for (a in 1:N) {
+    y_rep[a] = neg_binomial_rng(r, r/m[a]);
+    log_lik[a] = neg_binomial_lpmf(y[a] | r, r/m[a]);
+    true_inf[a] = lambda[a]*pop[a];
+  }
+
+}
+
+'
+```
+
+Define the data for STAN
+```{r}
+stan.nb4.standata <- list(
+  y=dat.final$Confirmed, 
+  N=nrow(X),
+  X=X,
+  Z=Z,
+  pop=dat.final$pop,
+  K=ncol(X),
+  GK=ncol(Z)
+)
+```
+
+Define initial values
+```{r}
+initf2 <- function(chain_id = 1) {
+  # cat("chain_id =", chain_id, "\n")
+  list(beta = array(c(0.05, rep(0, ncol(X)-1)), dim=ncol(X)),#rnorm(ncol(X), sd=0.1), dim = c(ncol(X))),
+       beta_raw = array(c(0.05, rep(0, ncol(X)-1)), dim=ncol(X)),
+       gamma = array(c(0.03, rep(0, ncol(Z)-1)), dim=ncol(Z)),
+       gamma_raw = array(c(0.03, rep(0, ncol(Z)-1)), dim=ncol(Z)),
+       theta = array(rep(0.01, nrow(X)), dim=nrow(X)),
+       r=1, #Size parameter for NB
+       rr=1, #Variance for beta likelihood
+       lr=1,
+       # mu_beta=0, #Hypermean for beta parameters
+       tau_b=1, #Var of Cauchy for betas
+       tau_g=1, #Var of Cauchy for gammas
+       lambda=array(rep(0.01,nrow(X)),dim=nrow(X)),
+       m=array(rep(0.01,nrow(X)),dim=nrow(X))
+       )
+}
+
+# generate a list of lists to specify initial values
+n_chains <- 4
+init_ll <- lapply(1:n_chains, function(id) initf2(chain_id = id))
+```
+
+
+Run the model
+```{r}
+stan.nb4.stanfit <- stan(
+  model_code = stan.nb4.stancode,
+  data=stan.nb4.standata, 
+  control = list(max_treedepth = 15, adapt_delta=0.9),
+  init = init_ll,
+  chains=4,
+  warmup=300,
+  iter=600,
+  cores=4
+)
+
+traceplot(stan.nb4.stanfit, pars = c("r", "rr", "tau_b", "tau_g"))
+traceplot(stan.nb4.stanfit, pars = c("lambda[51]"))
+print(stan.nb4.stanfit, pars = "lambda")
+print(stan.nb4.stanfit, pars=c("theta"))
+stan.nb4.est.true <- as.data.frame(stan.nb4.stanfit, pars="true_inf")
+stan.nb4.y_rep <- as.data.frame(stan.nb4.stanfit, pars="y_rep")
+dat.final$stan.nb4.est.true <- apply(stan.nb4.est.true, 2, mean)
+dat.final$stan.nb4.yrep <- apply(stan.nb4.y_rep, 2, mean)
+#Look at predicted vs. true values
+qplot(log(Confirmed), log(stan.nb4.yrep), data=dat.final)+geom_smooth(method="lm")
+# summary(lm(log(stan.nb4.yrep) ~ log(Confirmed), data=dat.final))
+#Calculate Gelman's Bayesian R2
+dat.final$stan.nb4.resids <- dat.final$stan.nb4.yrep - dat.final$Confirmed
+var(dat.final$stan.nb4.yrep)/(var(dat.final$stan.nb4.yrep)+var(dat.final$stan.nb4.resids)) #Bayesian r-squared of 0.684
+```
+
+There were 2 chains where the estimated Bayesian Fraction of Missing Information was low. See
+http://mc-stan.org/misc/warnings.html#bfmi-lowExamine the pairs() plot to diagnose sampling problems
+The largest R-hat is 1.69, indicating chains have not mixed.
+Running the chains for more iterations may help. See
+http://mc-stan.org/misc/warnings.html#r-hatBulk Effective Samples Size (ESS) is too low, indicating posterior means and medians may be unreliable.
+Running the chains for more iterations may help. See
+http://mc-stan.org/misc/warnings.html#bulk-essTail Effective Samples Size (ESS) is too low, indicating posterior variances and tail quantiles may be unreliable.
+Running the chains for more iterations may help. See
+http://mc-stan.org/misc/warnings.html#tail-ess
+
+Make a map
+```{r}
+# install.packages(c("ggspatial", "libwgeom", "sf", "rnaturalearth", "rnaturalearthdata", "googleway"))
+# install.packages(c("rgeos", "maps", "lwgeom", "ggrepel"))
+library(ggplot2); library(scales); library(ggstance)
+library(ggspatial); library(sf); library(lwgeom); library(ggrepel)
+library(rnaturalearth); library(rnaturalearthdata); library(googleway)
+library(rgeos)
+library(maps)
+library(gdata)
+
+theme_set(theme_bw())
+
+#Make base map
+world <- ne_countries(scale="medium", returnclass = "sf")
+states <- st_as_sf(map("state", plot = FALSE, fill = TRUE))
+states <- cbind(states, st_coordinates(st_centroid(states)))
+counties <- st_as_sf(map("county", plot = FALSE, fill = TRUE))
+#Get state column
+counties$state <- gsub("\\,[a-z \\,\\.\\s\\-\\'\\-]+", "", counties$ID)
+#Turn first letter into uppercase
+counties$state2 <- gsub('^([a-z])', '\\U\\1', gsub('\\s([a-z])', ' \\U\\1', counties$state, perl = T), perl = T)
+counties$state2[counties$state2 == "District Of Columbia"] <- "District of Columbia"
+#Get county column
+counties$county <- gsub('^[A-Za-z ]+\\,', '', counties$ID)
+#Turn first letter and letter after spaces into uppercase
+counties$county <- gsub('^([a-z])', '\\U\\1', gsub('\\s([a-z])', ' \\U\\1', counties$county, perl = T), perl = T)
+#Get state abbreviations in from a key file
+state.abb <- read.csv("/Users/tschappe/Documents/NC\ State\ Classes/ST540/Final\ Project/state_abb_key.csv")
+# state.abb <- read.csv("/Volumes/tschappe/Documents/NC\ State\ Classes/ST540/Final\ Project/state_abb_key.csv")
+#Make a new column with state abbreviations
+state.abb$State <- as.character(state.abb$State)
+state.abb$State <- gsub('^\\s', '', state.abb$State)
+state.abb$Abb <- as.character(state.abb$Abb)
+counties$state2 <- as.character(counties$state2)
+#Loop through and grab the abbreviation for each state
+counties$state_abb <- 1:nrow(counties)
+for (i in 1:nrow(counties)) {
+  counties$state_abb[i] <- (state.abb$Abb[state.abb$State == counties$state2[i]])
+}
+counties$state_county <- paste(counties$state_abb, counties$county, sep="_")
+#Subset counties dataframe to match what dat.final has
+counties2 <- counties[counties$state_county %in% dat.final$state_county, ]
+#Loop through and grab the correct estimated infection values from final.dat. dat.final$state_county has punctuation, so remove it first
+counties2$est.true.inf <- 1:nrow(counties2)
+for (i in 1:nrow(counties2)) {
+  counties2$est.true.inf[i] <- (dat.final$stan.nb4.est.true[gsub("[\\,\\.\\-\\'\\-]+", "", dat.final$state_county) == counties2$state_county[i]])
+}
+# counties <- subset(counties, grepl("north carolina", counties$ID))
+counties2$est.true.inf <- as.numeric(counties2$est.true.inf)
+
+(infection.map1 <- ggplot(data = world) +
+  geom_sf() +
+  geom_sf(data = counties2, aes(fill = log(counties2$est.true.inf)))+
+  # geom_label_repel(data = sites.coords, mapping = aes(
+  #   x = X,
+  #   y = Y,
+  #   label = ID,
+  #   fill=Genotype),
+  #   size=4
+  # )+
+  # scale_fill_manual(name="G143A Allele", breaks = c("H", "M", "W"), labels = c("Mixed", "Resistant", "Susceptible"), values = c(ggcols[4], ggcols[1], ggcols[3]))+
+  coord_sf(xlim = c(-126, -66), ylim = c(24, 51), expand = FALSE))
+
+(infection.map2 <- ggplot(data = world) +
+  geom_sf() +
+  geom_sf(data = counties2, aes(fill = log(counties2$est.true.inf)))+
+  # geom_label_repel(data = sites.coords, mapping = aes(
+  #   x = X,
+  #   y = Y,
+  #   label = ID,
+  #   fill=Genotype),
+  #   size=4
+  # )+
+  # scale_fill_manual(name="G143A Allele", breaks = c("H", "M", "W"), labels = c("Mixed", "Resistant", "Susceptible"), values = c(ggcols[4], ggcols[1], ggcols[3]))+
+  coord_sf(xlim = c(-86, -68), ylim = c(24, 46), expand = FALSE))
+```
+
+```{r}
+library(HDInterval)
+hdis <- apply(stan.nb4.est.true, 2, FUN = function(x) hdi(x, credMass = 0.95))
+hdis <- t(hdis)
+# hdis.lambda <- apply(stan.nb4.lambda, 2, FUN = function(x) hdi(x, credMass = 0.95))
+# hdis.lambda <- t(hdis.lambda)
+hdis.all <- data.frame(
+  state_county=dat.final$state_county[dat.final$state_county %in% c("NC_Wake", "NC_Mecklenburg", "IL_Cook", "CA_Los Angeles", "NY_Westchester", "AZ_Maricopa", "WA_King", "GA_Fulton")],
+  inf.lower.HDI=hdis[dat.final$state_county %in% c("NC_Wake", "NC_Mecklenburg", "IL_Cook", "CA_Los Angeles", "NY_Westchester", "AZ_Maricopa", "WA_King", "GA_Fulton"),1],
+  inf.upper.HDI=hdis[dat.final$state_county %in% c("NC_Wake", "NC_Mecklenburg", "IL_Cook", "CA_Los Angeles", "NY_Westchester", "AZ_Maricopa", "WA_King", "GA_Fulton"),2]
+  # prop.lower.HDI=hdis.lambda[dat.final$state_county %in% c("NC_Wake", "NC_Mecklenburg", "IL_Cook", "CA_Los Angeles", "NY_Westchester", "AZ_Maricopa", "WA_King", "GA_Fulton"),1],
+  # prop.upper.HDI=hdis.lambda[dat.final$state_county %in% c("NC_Wake", "NC_Mecklenburg", "IL_Cook", "CA_Los Angeles", "NY_Westchester", "AZ_Maricopa", "WA_King", "GA_Fulton"),2]
+  )
+```
+
